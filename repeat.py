@@ -11,10 +11,17 @@ import pygame.mixer as mixer
 import pygame.time
 import RPi.GPIO as GPIO
 import collections
+import random
 from Queue import Queue
 from threading import Timer
 
 Position = collections.namedtuple('Position', 'soundName inPin outPin')
+class State(object):
+	__slots__ = 'value'
+	def __init__(self, value=None):
+		self.value = value
+	def __nonzero__(self):
+		return bool(self.value)
 
 # Start sound mixer
 mixer.init()
@@ -30,6 +37,8 @@ positions = [
 # Sound corresponding to wrong answer
 WRONG = Position('lose', None, None)
 
+# Number of turns needed to win
+MAX_SEQUENCE = 5
 
 cachedSounds = {}
 
@@ -58,6 +67,9 @@ inPinToPositionIndex = {}
 for index, position in enumerate(positions):
 	inPinToPositionIndex[position.inPin] = index
 
+# Random number generation
+def getRandomPosition():
+	return random.randrange(len(positions))
 
 # Resynchronized button events
 
@@ -68,15 +80,18 @@ def clearEvents():
 		events.queue.clear()
 
 def waitForEvents(timeout, callback):
-	# Schedule a timeout event to be added from another thread.
 	shouldStillTimeout = True
+	ourTimer = None
 	ourTimeoutMarker = object()
-	def onTimeout():
-		if shouldStillTimeout:
-			events.put((None, ourTimeoutMarker))
 
-	ourTimer = Timer(timeout / 1000.0, onTimeout)
-	ourTimer.start()
+	if timeout is not None:
+		# Schedule a timeout event to be added from another thread.
+		def onTimeout():
+			if shouldStillTimeout:
+				events.put((None, ourTimeoutMarker))
+
+		ourTimer = Timer(timeout / 1000.0, onTimeout)
+		ourTimer.start()
 
 	# Watch the events queue.
 	while True:
@@ -84,14 +99,15 @@ def waitForEvents(timeout, callback):
 		if index is None and value is ourTimeoutMarker:
 			# Got timeout
 			return False
-		elif index is not None and not callback(index, value):
+		elif index is not None and callback(index, value):
 			# Best effort to cancel the timeout event (should be harmless if it
 			# slips through)
 			shouldStillTimeout = False
-			ourTimer.cancel()
-			# Callback returned false; not a timeout.
+			if ourTimer is not None:
+				ourTimer.cancel()
+			# Callback returned true; the event was handled and exits the loop.
 			return True
-		# else, stale timeout or callback returned true; keep going
+		# else, stale timeout or event was not handled; keep going
 
 # Both edges are watched so that the event shows up at least once per press or
 # release. The program is not fast enough to distinguish which edge appeared
@@ -123,6 +139,110 @@ def processEvent(pin):
 	events.put((index, value))
 	return value
 
+def lightOnly(index):
+	lit = None
+	for pi, position in enumerate(positions):
+		GPIO.output(position.outPin, pi == index)
+		lit = pi
+	return lit
+
+def lightClear():
+	lightOnly(None)
+
+def lightBeep(index):
+	lit = lightOnly(index)
+
+def lightBuzz(index):
+	lit = lightOnly(index)
+
+def attractLoop(waitFirst=None):
+	attracting = State(True)
+
+	def stopAttracting(index, value):
+		if value:
+			attracting.value = False
+			return True
+		return False
+
+	if waitFirst is not None:
+		lightClear()
+		waitForEvents(waitFirst, stopAttracting)
+
+	while attracting:
+		for pi, position in enumerate(positions):
+			if not attracting:
+				break
+			lightBeep(pi)
+			waitForEvents(250, stopAttracting)
+		if not attracting:
+			break
+		lightClear()
+		waitForEvents(5000, stopAttracting)
+
+def processRelease(index, value):
+	if index is not None and not value:
+		return True
+	return False
+
+def gameLoop():
+	sequence = []
+
+	waitForNextRound = False
+
+	while len(sequence) < MAX_SEQUENCE:
+		sequence.append(getRandomPosition())
+
+		if waitForNextRound:
+			delay(1000)
+		else:
+			waitForNextRound = True
+
+		# Play back current sequence
+		for pi in sequence:
+			lightBeep(pi)
+			delay(250)
+			lightClear()
+			delay(250)
+		lightClear()
+
+		# Get rid of any presses that happened during playback
+		clearEvents()
+
+		buttonValue = State(None)
+		def interpretButton(index, value):
+			if value:
+				buttonValue.value = index
+				return True
+			return False
+
+		# Read in sequence
+		for pi in sequence:
+			waitForEvents(3000, interpretButton)
+			if buttonValue.value == pi:
+				# Correct
+				lightBeep(pi)
+				waitForEvents(None, processRelease)
+				lightClear()
+			else:
+				# Very not correct
+				lightBuzz(pi)
+				delay(1500)
+				lightClear()
+				delay(2000)
+				return False
+
+	# It's a win.
+	delay(500)
+	victoryBoogie()
+	return True
+
+def victoryBoogie():
+	for pi in (0, 1, 0, 1, 2, 1, 2, 3, 2, 3):
+		lightBeep(pi)
+		delay(250)
+	lightClear()
+	clearEvents()
+
 def mainLoop():
 	for position in positions:
 		# Inputs are pulled up so no external pullup is necessary
@@ -130,17 +250,10 @@ def mainLoop():
 		GPIO.add_event_detect(position.inPin, GPIO.BOTH, callback=processEvent)
 		GPIO.setup(position.outPin, GPIO.OUT, initial=False)
 
-	def cb(index, value):
-		print "Got event %s -> %s" % (index, value)
-		return True
-
-	for outPin in (x.outPin for x in positions):
-		GPIO.output(outPin, True)
-		delay(500)
-
-	print "Waiting"
-	rv = waitForEvents(10000, cb)
-	print "Done waiting (%s)" % (rv)
+	attractLoop(0)
+	while True:
+		gameLoop()
+		attractLoop(5000)
 
 try:
 	GPIO.setmode(GPIO.BCM)
