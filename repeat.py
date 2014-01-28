@@ -15,7 +15,7 @@ import random
 from Queue import Queue
 from threading import Timer
 
-Position = collections.namedtuple('Position', 'soundName inPin outPin')
+Position = collections.namedtuple('Position', 'soundName inPin outPin sequenceLength')
 class State(object):
 	__slots__ = 'value'
 	def __init__(self, value=None):
@@ -30,17 +30,16 @@ mixer.init(frequency=22050, size=-8, channels=2, buffer=512)
 
 # Sounds and pins corresponding to buttons/lights
 positions = [
-	Position('s1', 4, 27),
-	Position('s2', 18, 24),
-	Position('s3', 23, 25),
-	Position('s4', 17, 22),
+	Position('s1', 4, 27, 4),
+	Position('s2', 18, 24, 8),
+	Position('s3', 23, 25, 16),
+	Position('s4', 17, 22, 32),
 ]
 
 # Sound corresponding to wrong answer
-WRONG = Position('lose', None, None)
+WRONG_SOUND_NAME = 'lose'
 
-# Number of turns needed to win
-MAX_SEQUENCE = 5
+
 
 cachedSounds = {}
 
@@ -50,8 +49,8 @@ def getSound(soundName):
 	return cachedSounds[soundName]
 
 # Preload sounds
-for position in positions + [WRONG]:
-	getSound(position.soundName)
+for soundName in [position.soundName for position in positions] + [WRONG_SOUND_NAME]:
+	getSound(soundName)
 
 # Placeholders for time manipulation
 
@@ -160,44 +159,61 @@ def lightBeep(index):
 
 def lightBuzz(index):
 	lit = lightOnly(index)
-	sound = getSound(WRONG.soundName)
+	sound = getSound(WRONG_SOUND_NAME)
 	sound.play()
 
 def attractLoop(waitFirst=None):
 	attracting = State(True)
-
-	def stopAttracting(index, value):
-		if value:
-			attracting.value = False
-			return True
-		return False
+	button = None
 
 	if waitFirst is not None:
 		lightClear()
-		waitForEvents(waitFirst, stopAttracting)
+		button = waitForButtonPress(waitFirst)
 
-	while attracting:
+	while button is None:
 		for pi, position in enumerate(positions):
-			if not attracting:
+			if button is not None:
 				break
 			lightBeep(pi)
-			waitForEvents(250, stopAttracting)
-		if not attracting:
+			button = waitForButtonPress(250)
+		if button is not None:
 			break
 		lightClear()
-		waitForEvents(5000, stopAttracting)
+		button = waitForButtonPress(5000)
 
+	print "Button was %s" % button
+	sequenceLength = positions[button].sequenceLength
+	print "SL was %s" % sequenceLength
+	return sequenceLength
+
+
+def waitForButtonEvent(timeout=None, value=None):
+	buttonValue = State(None)
+	def callback(index, in_value):
+		if index is not None and (value is None or value == in_value):
+			buttonValue.value = index
+			return True
+		return False
+	waitForEvents(timeout, callback)
+	return buttonValue.value
+
+def waitForButtonPress(timeout=None):
+	return waitForButtonEvent(timeout, True)
+
+def waitForButtonRelease(timeout=None):
+	return waitForButtonEvent(timeout, False)
+	
 def processRelease(index, value):
 	if index is not None and not value:
 		return True
 	return False
 
-def gameLoop():
+def gameLoop(sequenceLength):
 	sequence = []
 
 	waitForNextRound = False
 
-	while len(sequence) < MAX_SEQUENCE:
+	while len(sequence) < sequenceLength:
 		sequence.append(getRandomPosition())
 
 		if waitForNextRound:
@@ -216,20 +232,13 @@ def gameLoop():
 		# Get rid of any presses that happened during playback
 		clearEvents()
 
-		buttonValue = State(None)
-		def interpretButton(index, value):
-			if value:
-				buttonValue.value = index
-				return True
-			return False
-
 		# Read in sequence
 		for pi in sequence:
-			waitForEvents(3000, interpretButton)
-			if buttonValue.value == pi:
+			button = waitForButtonPress(3000)
+			if button == pi:
 				# Correct
 				lightBeep(pi)
-				waitForEvents(None, processRelease)
+				waitForButtonRelease()
 				lightClear()
 			else:
 				# Very not correct
@@ -258,10 +267,10 @@ def mainLoop():
 		GPIO.add_event_detect(position.inPin, GPIO.BOTH, callback=processEvent)
 		GPIO.setup(position.outPin, GPIO.OUT, initial=False)
 
-	attractLoop(0)
+	sequenceLength = attractLoop(0)
 	while True:
-		gameLoop()
-		attractLoop(5000)
+		gameLoop(sequenceLength)
+		sequenceLength = attractLoop(5000)
 
 try:
 	GPIO.setmode(GPIO.BCM)
