@@ -24,7 +24,9 @@ class State(object):
 		return bool(self.value)
 
 # Start sound mixer
-mixer.init()
+# The buffer size has to be set lower than the default (4096) in order to
+# decrease latency. Otherwise, the sounds and lights don't match well.
+mixer.init(frequency=22050, size=-8, channels=2, buffer=512)
 
 # Sounds and pins corresponding to buttons/lights
 positions = [
@@ -142,8 +144,10 @@ def processEvent(pin):
 def lightOnly(index):
 	lit = None
 	for pi, position in enumerate(positions):
-		GPIO.output(position.outPin, pi == index)
-		lit = pi
+		matched = (pi == index)
+		GPIO.output(position.outPin, matched)
+		if matched:
+			lit = pi
 	return lit
 
 def lightClear():
@@ -151,9 +155,13 @@ def lightClear():
 
 def lightBeep(index):
 	lit = lightOnly(index)
+	sound = getSound(positions[lit].soundName)
+	sound.play()	
 
 def lightBuzz(index):
 	lit = lightOnly(index)
+	sound = getSound(WRONG.soundName)
+	sound.play()
 
 def attractLoop(waitFirst=None):
 	attracting = State(True)
@@ -239,7 +247,7 @@ def gameLoop():
 def victoryBoogie():
 	for pi in (0, 1, 0, 1, 2, 1, 2, 3, 2, 3):
 		lightBeep(pi)
-		delay(250)
+		delay(125)
 	lightClear()
 	clearEvents()
 
