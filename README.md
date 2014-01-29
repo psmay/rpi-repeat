@@ -20,3 +20,4 @@ Connect the anodes of the respective LEDs to 27, 24, 25, 22. Connect each
 cathode through an appropriate series resistor (accounting for 3.3V input) to
 ground.
 
+![Schematic](circuit/repeat_schem_1024.png)
