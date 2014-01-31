@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# vim: set fileencoding=utf8 :
 
 # NOTE: This version is not the complete implementation!
 
@@ -129,8 +130,8 @@ for index, position in enumerate(positions):
 
 # In this program, timeouts and button presses and releases result in callbacks
 # being called in separate threads. The callbacks we use each deposit a value
-# in events, which is a Queue—Python's basic synchronized blocking queue.
-# The main thread can then simply wait on events to happen and process them in
+# in events, which is a Queue—Python's basic synchronized blocking queue. The
+# main thread can then simply wait on events to happen and process them in
 # order.
 events = Queue()
 
