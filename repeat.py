@@ -7,7 +7,7 @@
 # Written by Peter S. May for the public domain
 # Refer to README.md for details
 
-import pygame.mixer as mixer
+import pygame.mixer
 import pygame.time
 import RPi.GPIO as GPIO
 import collections
@@ -15,7 +15,23 @@ import random
 from Queue import Queue
 from threading import Timer
 
+
+# Classes/Types
+# -------------
+
+# A Position is data about one button/light. It is defined with these
+# parameters:
+# - soundName: The basename for the WAV file for the beep from this position
+# - inPin: The GPIO number of the pin connected to the button for this position
+# - outPin: The GPIO number of the pin connected to the LED for this position
+# - sequenceLength: When button is pressed during attract mode, the number of
+#   moves needed to win
 Position = collections.namedtuple('Position', 'soundName inPin outPin sequenceLength')
+
+# A State is just an object that holds a value in the mutable attribute
+# value. It's used here to make it possible to mutate non-global variables
+# from inside a nested function. (Python 3 has the nonlocal keyword to
+# accomplish the same more neatly.)
 class State(object):
 	__slots__ = 'value'
 	def __init__(self, value=None):
@@ -23,12 +39,10 @@ class State(object):
 	def __nonzero__(self):
 		return bool(self.value)
 
-# Start sound mixer
-# The buffer size has to be set lower than the default (4096) in order to
-# decrease latency. Otherwise, the sounds and lights don't match well.
-mixer.init(frequency=22050, size=-8, channels=2, buffer=512)
+# Predefined constant-like values
+# -------------------------------
 
-# Sounds and pins corresponding to buttons/lights
+# Positions for available buttons
 positions = [
 	Position('s1', 4, 27, 4),
 	Position('s2', 18, 24, 8),
@@ -36,60 +50,118 @@ positions = [
 	Position('s4', 17, 22, 32),
 ]
 
-# Sound corresponding to wrong answer
+# Basename for the WAV file corresponding to an incorrect move
 WRONG_SOUND_NAME = 'lose'
 
 
 
+# Support functions
+# -----------------
+
+# Loads a sound by the basename of its WAV file, caching the result for repeated
+# reads. Plays the sound unless preloadOnly.
 cachedSounds = {}
-
-def getSound(soundName):
+def makeSound(soundName, preloadOnly=False):
 	if soundName not in cachedSounds:
-		cachedSounds[soundName] = mixer.Sound("sound/%s.wav" % soundName)
-	return cachedSounds[soundName]
+		cachedSounds[soundName] = pygame.mixer.Sound("sound/%s.wav" % soundName)
+	sound = cachedSounds[soundName]
+	if not preloadOnly:
+		sound.play()
+	return sound
 
-# Preload sounds
-for soundName in [position.soundName for position in positions] + [WRONG_SOUND_NAME]:
-	getSound(soundName)
-
-# Placeholders for time manipulation
-
-def ticks():
-	return pygame.time.get_ticks()
-
+# Pause this thread by the given number of milliseconds.
 def delay(duration):
 	# wait causes the process to sleep.
 	return pygame.time.wait(duration)
 	# delay attempts to be more precise by busy-waiting.
 	# return pygame.time.delay(duration)
 
+# Random number generation
+def getRandomPosition():
+	return random.randrange(len(positions))
+
+# Turns on the light for the given position; turns off the light for all
+# others. If index is None (or not a position), all are turned off. Returns
+# the matched index, if any, or None otherwise.
+def lightOnly(index):
+	lit = None
+	for positionIndex, position in enumerate(positions):
+		matched = (positionIndex == index)
+		GPIO.output(position.outPin, matched)
+		if matched:
+			lit = positionIndex
+	return lit
+
+# Light only the given index, and also play its corresponding sound. If not
+# correct, play the fail sound instead.
+#
+# Note that the sound playing mechanism is asynchronous, so any necessary delay
+# needed to allow the sound to play must be performed explicitly.
+def activate(index, correct=True):
+	lit = lightOnly(index)
+	makeSound(positions[lit].soundName if correct else WRONG_SOUND_NAME)
+
+# Unlight all positions.
+def deactivate():
+	lightOnly(None)
+
+
+
+
+# Start sound mixer
+# The buffer size has to be set lower than the default (4096) in order to
+# decrease latency. Otherwise, the sounds and lights don't match well.
+pygame.mixer.init(frequency=22050, size=-8, channels=2, buffer=512)
+
+
+# Preload sounds
+for soundName in [position.soundName for position in positions] + [WRONG_SOUND_NAME]:
+	makeSound(soundName, False)
+
 # Map input pin back to position
 inPinToPositionIndex = {}
 for index, position in enumerate(positions):
 	inPinToPositionIndex[position.inPin] = index
 
-# Random number generation
-def getRandomPosition():
-	return random.randrange(len(positions))
 
-# Resynchronized button events
+# Events machinery
+# ----------------
 
+# In this program, timeouts and button presses and releases result in callbacks
+# being called in separate threads. The callbacks we use each deposit a value
+# in events, which is a Queue—Python's basic synchronized blocking queue.
+# The main thread can then simply wait on events to happen and process them in
+# order.
 events = Queue()
 
+
+# Awaiting events
+
+# Discard any information about pending events.
 def clearEvents():
 	with events.mutex:
 		events.queue.clear()
 
+# Calls a callback for each button event that appears in the queue, continuing
+# until the callback returns true. If timeout is defined, also schedules a
+# task to add a timeout event to the queue after the given delay (in ms), and
+# returns if that timeout event is processed before a call to the callback
+# returns true.
+# Returns true if the loop ended because a call to the callback returned true,
+# or false if the loop ended because of the timeout event.
 def waitForEvents(timeout, callback):
-	shouldStillTimeout = True
 	ourTimer = None
-	ourTimeoutMarker = object()
+	ourTimeoutMarker = None
 
 	if timeout is not None:
+		# This dummy object helps to check whether a timeout event was actually
+		# generated by this call. (It's theoretically possible that a stale
+		# timeout event from a previous call is still in the queue.)
+		ourTimeoutMarker = object()
+
 		# Schedule a timeout event to be added from another thread.
 		def onTimeout():
-			if shouldStillTimeout:
-				events.put((None, ourTimeoutMarker))
+			events.put((None, ourTimeoutMarker))
 
 		ourTimer = Timer(timeout / 1000.0, onTimeout)
 		ourTimer.start()
@@ -98,95 +170,18 @@ def waitForEvents(timeout, callback):
 	while True:
 		index, value = events.get()
 		if index is None and value is ourTimeoutMarker:
-			# Got timeout
+			# Got timeout event
 			return False
 		elif index is not None and callback(index, value):
-			# Best effort to cancel the timeout event (should be harmless if it
-			# slips through)
-			shouldStillTimeout = False
 			if ourTimer is not None:
 				ourTimer.cancel()
 			# Callback returned true; the event was handled and exits the loop.
 			return True
 		# else, stale timeout or event was not handled; keep going
 
-# Both edges are watched so that the event shows up at least once per press or
-# release. The program is not fast enough to distinguish which edge appeared
-# all of the time, and software debounce makes the response sluggish (in this
-# case). So, the event processing applies some simple (yet not fully
-# goof-proof)) logic to determine whether we think the state has changed.
-# Button events and timeouts originate from separate threads and come together
-# into a thread-safe blocking queue, which is then used to run the game
-# synchronously.
-currentButton = None
-def processEvent(pin):
-	global currentButton
-	index = inPinToPositionIndex[pin]
-	# Since 'pressed' is false, invert.
-	value = not GPIO.input(pin)
-
-	if currentButton is None and value:
-		# New button is pressed.
-		currentButton = index
-	elif currentButton == index and not value:
-		# Current button is released.
-		currentButton = None
-	else:
-		# If the event is for a press of a button when a button is already
-		# down, or for the release of the button that isn't the currently down
-		# button, it is ignored.
-		return None
-
-	events.put((index, value))
-	return value
-
-def lightOnly(index):
-	lit = None
-	for pi, position in enumerate(positions):
-		matched = (pi == index)
-		GPIO.output(position.outPin, matched)
-		if matched:
-			lit = pi
-	return lit
-
-def lightClear():
-	lightOnly(None)
-
-def lightBeep(index):
-	lit = lightOnly(index)
-	sound = getSound(positions[lit].soundName)
-	sound.play()	
-
-def lightBuzz(index):
-	lit = lightOnly(index)
-	sound = getSound(WRONG_SOUND_NAME)
-	sound.play()
-
-def attractLoop(waitFirst=None):
-	attracting = State(True)
-	button = None
-
-	if waitFirst is not None:
-		lightClear()
-		button = waitForButtonPress(waitFirst)
-
-	while button is None:
-		for pi, position in enumerate(positions):
-			if button is not None:
-				break
-			lightBeep(pi)
-			button = waitForButtonPress(250)
-		if button is not None:
-			break
-		lightClear()
-		button = waitForButtonPress(5000)
-
-	print "Button was %s" % button
-	sequenceLength = positions[button].sequenceLength
-	print "SL was %s" % sequenceLength
-	return sequenceLength
-
-
+# Waits for any event for any button, or for a timeout. If value is given, events
+# not matching that value are discarded. Returns None on timeout; otherwise,
+# returns the index of the changed position.
 def waitForButtonEvent(timeout=None, value=None):
 	buttonValue = State(None)
 	def callback(index, in_value):
@@ -197,54 +192,139 @@ def waitForButtonEvent(timeout=None, value=None):
 	waitForEvents(timeout, callback)
 	return buttonValue.value
 
+# Waits for a press event for any button, or for a timeout.
 def waitForButtonPress(timeout=None):
 	return waitForButtonEvent(timeout, True)
 
+# Waits for a release event for any button, or for a timeout.
 def waitForButtonRelease(timeout=None):
 	return waitForButtonEvent(timeout, False)
-	
-def processRelease(index, value):
-	if index is not None and not value:
-		return True
-	return False
 
+
+
+# Producing events
+
+# GPIO edge callback to produce button events for the queue.
+# Both edges are watched so that the event shows up at least once per press or
+# release. The program is not fast enough to distinguish which edge appeared
+# all of the time, and software debounce makes the response sluggish (in this
+# case). So, the event processing applies some simple (yet not fully
+# goof-proof)) logic to determine whether we think the state has changed.
+#
+# - An edge only triggers a check; whether or not the button is down depends on
+#   its GPIO.input() value.
+# - The game only considers at most one button to be pressed at any time. If a
+#   button is already down, any new button events are discarded except for a
+#   release event from the same button.
+#
+# Only those events not discarded above are added to the queue.
+currentButton = State(None)
+def processEvent(pin):
+	index = inPinToPositionIndex[pin]
+	# Since 'pressed' is false, invert.
+	value = not GPIO.input(pin)
+
+	if currentButton.value is None and value:
+		# New button is pressed.
+		currentButton.value = index
+	elif currentButton.value == index and not value:
+		# Current button is released.
+		currentButton.value = None
+	else:
+		# If the event is for a press of a button when a button is already
+		# down, or for the release of the button that isn't the currently down
+		# button, it is ignored.
+		return None
+
+	events.put((index, value))
+	return value
+
+
+
+
+
+
+
+
+
+# Game
+# ----
+
+
+# Play an attract pattern while waiting for the player to start the game. Any
+# button press starts the game, but the position determines the sequence length
+# (the number of moves needed to win).
+#
+# If waitFirst is provided, the pattern will not begin playing for waitFirst
+# ms, but it will still be possible to start a new game. (This is used to
+# provide the delay between the end of a game and the beginning of the attract
+# pattern.)
+#
+# Returns the selected sequence length.
+def attractLoop(waitFirst=None):
+	button = None
+
+	if waitFirst is not None:
+		deactivate()
+		button = waitForButtonPress(waitFirst)
+
+	while button is None:
+		for index, position in enumerate(positions):
+			if button is not None:
+				break
+			activate(index)
+			button = waitForButtonPress(250)
+		if button is not None:
+			break
+		deactivate()
+		button = waitForButtonPress(5000)
+
+	sequenceLength = positions[button].sequenceLength
+	print "Will start game with sequence length = %s" % sequenceLength
+	return sequenceLength
+
+
+# Play an actual game using the given sequence length.
 def gameLoop(sequenceLength):
+	# List of indices played by the CPU.
 	sequence = []
 
 	waitForNextRound = False
 
 	while len(sequence) < sequenceLength:
+		# Generate the next move and add it to the list.
 		sequence.append(getRandomPosition())
 
+		# A delay is inserted between rounds, but not before the first or after
+		# the last.
 		if waitForNextRound:
 			delay(1000)
 		else:
 			waitForNextRound = True
 
-		# Play back current sequence
-		for pi in sequence:
-			lightBeep(pi)
+		# Play back current sequence.
+		for index in sequence:
+			activate(index)
 			delay(250)
-			lightClear()
+			deactivate()
 			delay(250)
-		lightClear()
 
-		# Get rid of any presses that happened during playback
+		# Discard any presses that may have happened during playback.
 		clearEvents()
 
 		# Read in sequence
-		for pi in sequence:
+		for index in sequence:
 			button = waitForButtonPress(3000)
-			if button == pi:
+			if button == index:
 				# Correct
-				lightBeep(pi)
+				activate(index)
 				waitForButtonRelease()
-				lightClear()
+				deactivate()
 			else:
 				# Very not correct
-				lightBuzz(pi)
+				activate(index, False)
 				delay(1500)
-				lightClear()
+				deactivate()
 				delay(2000)
 				return False
 
@@ -254,10 +334,10 @@ def gameLoop(sequenceLength):
 	return True
 
 def victoryBoogie():
-	for pi in (0, 1, 0, 1, 2, 1, 2, 3, 2, 3):
-		lightBeep(pi)
+	for index in (0, 1, 0, 1, 2, 1, 2, 3, 2, 3):
+		activate(index)
 		delay(125)
-	lightClear()
+	deactivate()
 	clearEvents()
 
 def mainLoop():
