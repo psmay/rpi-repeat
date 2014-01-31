@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 # vim: set fileencoding=utf8 :
 
-# NOTE: This version is not the complete implementation!
-
 # repeat.py
 # GPIO and sound example for Raspberry Pi
 # Written by Peter S. May for the public domain
 # Refer to README.md for details
 
+import sys
 import pygame.mixer
 import pygame.time
 import RPi.GPIO as GPIO
@@ -40,11 +39,12 @@ class State(object):
 	def __nonzero__(self):
 		return bool(self.value)
 
+
 # Predefined constant-like values
 # -------------------------------
 
 # Positions for available buttons
-positions = [
+_positions = [
 	Position('s1', 4, 27, 4),
 	Position('s2', 18, 24, 8),
 	Position('s3', 23, 25, 16),
@@ -55,74 +55,84 @@ positions = [
 WRONG_SOUND_NAME = 'lose'
 
 
-
 # Support functions
 # -----------------
 
-# Loads a sound by the basename of its WAV file, caching the result for repeated
-# reads. Plays the sound unless preloadOnly.
-cachedSounds = {}
+_cachedSounds = {}
 def makeSound(soundName, preloadOnly=False):
-	if soundName not in cachedSounds:
-		cachedSounds[soundName] = pygame.mixer.Sound("sound/%s.wav" % soundName)
-	sound = cachedSounds[soundName]
+	"""
+	Loads a sound by the basename of its WAV file, caching the result for
+	repeated reads. Plays the sound unless preloadOnly.
+
+	Returns the Sound object.
+	"""
+	if soundName not in _cachedSounds:
+		_cachedSounds[soundName] = pygame.mixer.Sound("sound/%s.wav" % soundName)
+	sound = _cachedSounds[soundName]
 	if not preloadOnly:
 		sound.play()
 	return sound
 
-# Pause this thread by the given number of milliseconds.
 def delay(duration):
+	"""Pauses this thread by the given number of milliseconds."""
 	# wait causes the process to sleep.
 	return pygame.time.wait(duration)
 	# delay attempts to be more precise by busy-waiting.
 	# return pygame.time.delay(duration)
 
-# Random number generation
 def getRandomPosition():
-	return random.randrange(len(positions))
+	"""Generates a pseudorandom position index."""
+	return random.randrange(len(_positions))
 
-# Turns on the light for the given position; turns off the light for all
-# others. If index is None (or not a position), all are turned off. Returns
-# the matched index, if any, or None otherwise.
 def lightOnly(index):
+	"""
+	Turns on the light for the given position; turns off the light for all
+	others. If index is None (or not a position), all are turned off. Returns
+	the matched index, if any, or None otherwise.
+	"""
 	lit = None
-	for positionIndex, position in enumerate(positions):
+	for positionIndex, position in enumerate(_positions):
 		matched = (positionIndex == index)
 		GPIO.output(position.outPin, matched)
 		if matched:
 			lit = positionIndex
 	return lit
 
-# Light only the given index, and also play its corresponding sound. If not
-# correct, play the fail sound instead.
-#
-# Note that the sound playing mechanism is asynchronous, so any necessary delay
-# needed to allow the sound to play must be performed explicitly.
 def activate(index, correct=True):
-	lit = lightOnly(index)
-	makeSound(positions[lit].soundName if correct else WRONG_SOUND_NAME)
+	"""
+	Light only the given index, and also play its corresponding sound. If not
+	correct, play the fail sound instead.
 
-# Unlight all positions.
+	Note that the sound playing mechanism is asynchronous, so any necessary
+	delay needed to allow the sound to play must be performed explicitly.
+	"""
+	lit = lightOnly(index)
+	makeSound(_positions[lit].soundName if correct else WRONG_SOUND_NAME)
+
 def deactivate():
+	"""Unlight all positions."""
 	lightOnly(None)
 
+def startSoundMixer():
+	"""Starts sound mixer."""
+	# The buffer size has to be set lower than the default (4096) in order to
+	# decrease latency. Otherwise, the sounds and lights don't match well.
+	pygame.mixer.init(frequency=22050, size=-8, channels=2, buffer=512)
 
+def preloadSounds():
+	"""Pre-fetches known sound samples."""
+	for soundName in [position.soundName for position in _positions] + [WRONG_SOUND_NAME]:
+		makeSound(soundName, False)
 
+_inPinToPositionIndex = {}
+def preMapInputPinsToPositions():
+	"""Generates mapping of input pins to their positions."""
+	for index, position in enumerate(_positions):
+		_inPinToPositionIndex[position.inPin] = index
 
-# Start sound mixer
-# The buffer size has to be set lower than the default (4096) in order to
-# decrease latency. Otherwise, the sounds and lights don't match well.
-pygame.mixer.init(frequency=22050, size=-8, channels=2, buffer=512)
-
-
-# Preload sounds
-for soundName in [position.soundName for position in positions] + [WRONG_SOUND_NAME]:
-	makeSound(soundName, False)
-
-# Map input pin back to position
-inPinToPositionIndex = {}
-for index, position in enumerate(positions):
-	inPinToPositionIndex[position.inPin] = index
+def getPositionForPin(pin):
+	"""Returns position associated with pin number."""
+	return _inPinToPositionIndex[pin]
 
 
 # Events machinery
@@ -133,24 +143,24 @@ for index, position in enumerate(positions):
 # in events, which is a Queue—Python's basic synchronized blocking queue. The
 # main thread can then simply wait on events to happen and process them in
 # order.
-events = Queue()
+_events = Queue()
 
-
-# Awaiting events
-
-# Discard any information about pending events.
 def clearEvents():
-	with events.mutex:
-		events.queue.clear()
+	"""Discard any information about pending events."""
+	with _events.mutex:
+		_events.queue.clear()
 
-# Calls a callback for each button event that appears in the queue, continuing
-# until the callback returns true. If timeout is defined, also schedules a
-# task to add a timeout event to the queue after the given delay (in ms), and
-# returns if that timeout event is processed before a call to the callback
-# returns true.
-# Returns true if the loop ended because a call to the callback returned true,
-# or false if the loop ended because of the timeout event.
 def waitForEvents(timeout, callback):
+	"""
+	Calls a callback for each button event that appears in the queue,
+	continuing until the callback returns true. If timeout is defined, also
+	schedules a task to add a timeout event to the queue after the given delay
+	(in ms), and returns if that timeout event is processed before a call to
+	the callback returns true.
+
+	Returns true if the loop ended because a call to the callback returned
+	true, or false if the loop ended because of the timeout event.
+	"""
 	ourTimer = None
 	ourTimeoutMarker = None
 
@@ -162,14 +172,14 @@ def waitForEvents(timeout, callback):
 
 		# Schedule a timeout event to be added from another thread.
 		def onTimeout():
-			events.put((None, ourTimeoutMarker))
+			_events.put((None, ourTimeoutMarker))
 
 		ourTimer = Timer(timeout / 1000.0, onTimeout)
 		ourTimer.start()
 
 	# Watch the events queue.
 	while True:
-		index, value = events.get()
+		index, value = _events.get()
 		if index is None and value is ourTimeoutMarker:
 			# Got timeout event
 			return False
@@ -180,10 +190,12 @@ def waitForEvents(timeout, callback):
 			return True
 		# else, stale timeout or event was not handled; keep going
 
-# Waits for any event for any button, or for a timeout. If value is given, events
-# not matching that value are discarded. Returns None on timeout; otherwise,
-# returns the index of the changed position.
 def waitForButtonEvent(timeout=None, value=None):
+	"""
+	Waits for any event for any button, or for a timeout. If value is given,
+	events not matching that value are discarded. Returns None on timeout;
+	otherwise, returns the index of the changed position.
+	"""
 	buttonValue = State(None)
 	def callback(index, in_value):
 		if index is not None and (value is None or value == in_value):
@@ -193,76 +205,75 @@ def waitForButtonEvent(timeout=None, value=None):
 	waitForEvents(timeout, callback)
 	return buttonValue.value
 
-# Waits for a press event for any button, or for a timeout.
 def waitForButtonPress(timeout=None):
+	"""Waits for a press event for any button, or for a timeout."""
 	return waitForButtonEvent(timeout, True)
 
-# Waits for a release event for any button, or for a timeout.
 def waitForButtonRelease(timeout=None):
+	"""Waits for a release event for any button, or for a timeout."""
 	return waitForButtonEvent(timeout, False)
 
 
+# Direct button handling
+# ----------------------
 
-# Producing events
-
-# GPIO edge callback to produce button events for the queue.
-# Both edges are watched so that the event shows up at least once per press or
-# release. The program is not fast enough to distinguish which edge appeared
-# all of the time, and software debounce makes the response sluggish (in this
-# case). So, the event processing applies some simple (yet not fully
-# goof-proof)) logic to determine whether we think the state has changed.
-#
-# - An edge only triggers a check; whether or not the button is down depends on
-#   its GPIO.input() value.
-# - The game only considers at most one button to be pressed at any time. If a
-#   button is already down, any new button events are discarded except for a
-#   release event from the same button.
-#
-# Only those events not discarded above are added to the queue.
-currentButton = State(None)
+_currentButton = State(None)
 def processEvent(pin):
-	index = inPinToPositionIndex[pin]
+	"""
+	GPIO edge callback to produce button events for the queue.
+
+	Both edges are watched so that the event shows up at least once per press
+	or release. The program is not fast enough to distinguish which edge
+	appeared all of the time, and software debounce makes the response sluggish
+	(in this case). So, the event processing applies some simple (yet not fully
+	goof-proof) logic to determine whether we think the state has changed.
+
+	- An edge only triggers a check; whether or not the button is down depends
+	  on its GPIO.input() value.
+	- The game only considers at most one button to be pressed at any time. If
+	  a button is already down, any new button events are discarded except for
+	  a release event from the same button.
+
+	Only those events not discarded above are added to the queue.
+	"""
+
+	index = getPositionForPin(pin)
 	# Since 'pressed' is false, invert.
 	value = not GPIO.input(pin)
 
-	if currentButton.value is None and value:
+	if _currentButton.value is None and value:
 		# New button is pressed.
-		currentButton.value = index
-	elif currentButton.value == index and not value:
+		_currentButton.value = index
+	elif _currentButton.value == index and not value:
 		# Current button is released.
-		currentButton.value = None
+		_currentButton.value = None
 	else:
 		# If the event is for a press of a button when a button is already
 		# down, or for the release of the button that isn't the currently down
 		# button, it is ignored.
 		return None
 
-	events.put((index, value))
+	_events.put((index, value))
 	return value
-
-
-
-
-
-
-
 
 
 # Game
 # ----
 
 
-# Play an attract pattern while waiting for the player to start the game. Any
-# button press starts the game, but the position determines the sequence length
-# (the number of moves needed to win).
-#
-# If waitFirst is provided, the pattern will not begin playing for waitFirst
-# ms, but it will still be possible to start a new game. (This is used to
-# provide the delay between the end of a game and the beginning of the attract
-# pattern.)
-#
-# Returns the selected sequence length.
 def attractLoop(waitFirst=None):
+	"""
+	Play an attract pattern while waiting for the player to start the game. Any
+	button press starts the game, but the position determines the sequence
+	length (the number of moves needed to win).
+
+	If waitFirst is provided, the pattern will not begin playing for waitFirst
+	ms, but it will still be possible to start a new game. (This is used to
+	provide the delay between the end of a game and the beginning of the
+	attract pattern.)
+
+	Returns the selected sequence length.
+	"""
 	button = None
 
 	if waitFirst is not None:
@@ -270,7 +281,7 @@ def attractLoop(waitFirst=None):
 		button = waitForButtonPress(waitFirst)
 
 	while button is None:
-		for index, position in enumerate(positions):
+		for index, position in enumerate(_positions):
 			if button is not None:
 				break
 			activate(index)
@@ -280,13 +291,13 @@ def attractLoop(waitFirst=None):
 		deactivate()
 		button = waitForButtonPress(5000)
 
-	sequenceLength = positions[button].sequenceLength
+	sequenceLength = _positions[button].sequenceLength
 	print "Will start game with sequence length = %s" % sequenceLength
 	return sequenceLength
 
-
-# Play an actual game using the given sequence length.
 def gameLoop(sequenceLength):
+	"""Play an actual game using the given sequence length."""
+
 	# List of indices played by the CPU.
 	sequence = []
 
@@ -335,14 +346,25 @@ def gameLoop(sequenceLength):
 	return True
 
 def victoryBoogie():
+	"""Displays a celebratory animation."""
 	for index in (0, 1, 0, 1, 2, 1, 2, 3, 2, 3):
 		activate(index)
 		delay(125)
 	deactivate()
 	clearEvents()
 
+
+# Entry points
+# ------------
+
 def mainLoop():
-	for position in positions:
+	"""Sets up GPIO and sound, then alternates between attract and game sequences."""
+
+	startSoundMixer()
+	preloadSounds()
+	preMapInputPinsToPositions()
+
+	for position in _positions:
 		# Inputs are pulled up so no external pullup is necessary
 		GPIO.setup(position.inPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 		GPIO.add_event_detect(position.inPin, GPIO.BOTH, callback=processEvent)
@@ -353,9 +375,28 @@ def mainLoop():
 		gameLoop(sequenceLength)
 		sequenceLength = attractLoop(5000)
 
-try:
-	GPIO.setmode(GPIO.BCM)
-	mainLoop()
-finally:
-	GPIO.cleanup()
+def main(args):
+	"""Runs the main program."""
+	# This try block causes GPIO.cleanup() to execute no matter whether mainLoop()
+	# exits by a normal return or a thrown exception (such as a KeyboardInterrupt
+	# resulting from pressing ctrl-C). Because the lifetime of the systemwide GPIO
+	# on the Pi is longer than the lifetime of this program, and because other
+	# programs might share it, this cleanup bit is actually pretty necessary.
+	#
+	# All of the code that actually uses GPIO is squirreled away into mainLoop() so
+	# that the extra level of nesting from this block might be either avoided or
+	# made clearer. If a bit of code ever gets to be too long (say, more than one
+	# screenful) or too deep (say, four or five indents), seriously consider
+	# refactoring parts of it into separate functions.
+	try:
+		GPIO.setmode(GPIO.BCM)
+		mainLoop()
+	finally:
+		GPIO.cleanup()
+
+# This is a convention used to prevent the main code from running if this file
+# is loaded as a library instead of a program. It's not strictly necessary here
+# but it may be worth developing the habit of including it.
+if __name__ == "__main__":
+	main(sys.argv)
 
